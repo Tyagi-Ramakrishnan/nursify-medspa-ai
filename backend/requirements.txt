@@ -14,5 +14,5 @@ redis==5.0.4
 python-dotenv==1.0.1
 jinja2==3.1.4
 aiosmtplib==3.0.1
-intuitlib==2.0.0
-quickbooks-python==0.9.5
+intuitlib==1.2.1
+python-quickbooks==0.9.4
