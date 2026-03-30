@@ -1,53 +1,71 @@
 """
-QuickBooks service — handles OAuth flow and transaction sync.
-
-OAuth flow:
-  1. User hits /api/v1/quickbooks/connect  → redirected to Intuit login
-  2. Intuit redirects back to /api/v1/quickbooks/callback with auth code
-  3. We exchange code for access + refresh tokens, store in DB
-  4. Celery job calls sync_transactions() every 15 minutes
+QuickBooks service — OAuth 2.0 and transaction sync using direct HTTP calls.
+No third-party QB libraries needed — just httpx.
 """
 
+import base64
 from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import urlencode
 import httpx
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
-from intuitlib.client import AuthClient
-from intuitlib.enums import Scopes
 from app.core.config import settings
 from app.models.models import Transaction, QuickBooksToken
 
+INTUIT_AUTH_URL = "https://appcenter.intuit.com/connect/oauth2"
+INTUIT_TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+SCOPES = "com.intuit.quickbooks.accounting"
 
-def get_auth_client() -> AuthClient:
-    return AuthClient(
-        client_id=settings.QB_CLIENT_ID,
-        client_secret=settings.QB_CLIENT_SECRET,
-        redirect_uri=settings.QB_REDIRECT_URI,
-        environment=settings.QB_ENVIRONMENT,
-    )
+QB_BASE = {
+    "sandbox": "https://sandbox-quickbooks.api.intuit.com",
+    "production": "https://quickbooks.api.intuit.com",
+}
+
+
+def _basic_auth_header() -> str:
+    creds = f"{settings.QB_CLIENT_ID}:{settings.QB_CLIENT_SECRET}"
+    return "Basic " + base64.b64encode(creds.encode()).decode()
 
 
 def get_authorization_url() -> str:
-    """Step 1: Generate the URL to send the user to Intuit for login."""
-    auth_client = get_auth_client()
-    return auth_client.get_authorization_url([Scopes.ACCOUNTING])
+    params = {
+        "client_id": settings.QB_CLIENT_ID,
+        "scope": SCOPES,
+        "redirect_uri": settings.QB_REDIRECT_URI,
+        "response_type": "code",
+        "state": "nursify_medspa",
+    }
+    return f"{INTUIT_AUTH_URL}?{urlencode(params)}"
 
 
 def handle_callback(auth_code: str, realm_id: str, db: Session) -> QuickBooksToken:
-    """Step 2: Exchange auth code for tokens and store them."""
-    auth_client = get_auth_client()
-    auth_client.get_bearer_token(auth_code, realm_id=realm_id)
+    with httpx.Client() as client:
+        resp = client.post(
+            INTUIT_TOKEN_URL,
+            headers={
+                "Authorization": _basic_auth_header(),
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            data={
+                "grant_type": "authorization_code",
+                "code": auth_code,
+                "redirect_uri": settings.QB_REDIRECT_URI,
+            },
+        )
+        resp.raise_for_status()
+        tokens = resp.json()
 
     token = db.query(QuickBooksToken).filter_by(realm_id=realm_id).first()
     if not token:
         token = QuickBooksToken(realm_id=realm_id)
         db.add(token)
 
-    token.access_token = auth_client.access_token
-    token.refresh_token = auth_client.refresh_token
-    token.access_token_expires_at = datetime.utcnow() + timedelta(seconds=3600)
-    token.refresh_token_expires_at = datetime.utcnow() + timedelta(days=100)
+    token.access_token = tokens["access_token"]
+    token.refresh_token = tokens["refresh_token"]
+    token.access_token_expires_at = datetime.utcnow() + timedelta(seconds=tokens.get("expires_in", 3600))
+    token.refresh_token_expires_at = datetime.utcnow() + timedelta(seconds=tokens.get("x_refresh_token_expires_in", 8640000))
     token.is_active = True
     db.commit()
     db.refresh(token)
@@ -55,46 +73,45 @@ def handle_callback(auth_code: str, realm_id: str, db: Session) -> QuickBooksTok
 
 
 def refresh_access_token(token: QuickBooksToken, db: Session) -> QuickBooksToken:
-    """Refresh the access token using the refresh token before it expires."""
-    auth_client = get_auth_client()
-    auth_client.refresh(refresh_token=token.refresh_token)
+    with httpx.Client() as client:
+        resp = client.post(
+            INTUIT_TOKEN_URL,
+            headers={
+                "Authorization": _basic_auth_header(),
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": token.refresh_token,
+            },
+        )
+        resp.raise_for_status()
+        tokens = resp.json()
 
-    token.access_token = auth_client.access_token
-    token.refresh_token = auth_client.refresh_token
-    token.access_token_expires_at = datetime.utcnow() + timedelta(seconds=3600)
+    token.access_token = tokens["access_token"]
+    token.refresh_token = tokens.get("refresh_token", token.refresh_token)
+    token.access_token_expires_at = datetime.utcnow() + timedelta(seconds=tokens.get("expires_in", 3600))
     db.commit()
     return token
 
 
 def get_active_token(db: Session) -> Optional[QuickBooksToken]:
-    """Get the active QB token, refreshing if needed."""
     token = db.query(QuickBooksToken).filter_by(is_active=True).first()
     if not token:
         return None
-
-    # Refresh if expiring within 5 minutes
     if token.access_token_expires_at < datetime.utcnow() + timedelta(minutes=5):
         token = refresh_access_token(token, db)
-
     return token
 
 
 def sync_transactions(db: Session, days_back: int = 1) -> dict:
-    """
-    Pull invoices and payments from QuickBooks and store them.
-    Uses external_id + source as the deduplication key — safe to run repeatedly.
-    """
     token = get_active_token(db)
     if not token:
         return {"status": "error", "message": "No active QuickBooks connection"}
 
     since_date = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    base_url = (
-        "https://sandbox-quickbooks.api.intuit.com"
-        if settings.QB_ENVIRONMENT == "sandbox"
-        else "https://quickbooks.api.intuit.com"
-    )
-
+    base_url = QB_BASE.get(settings.QB_ENVIRONMENT, QB_BASE["sandbox"])
     headers = {
         "Authorization": f"Bearer {token.access_token}",
         "Accept": "application/json",
@@ -103,12 +120,10 @@ def sync_transactions(db: Session, days_back: int = 1) -> dict:
     created = 0
     skipped = 0
 
-    # Fetch invoices (booked revenue)
-    invoice_query = f"SELECT * FROM Invoice WHERE TxnDate >= '{since_date}'"
     with httpx.Client() as client:
         resp = client.get(
             f"{base_url}/v3/company/{token.realm_id}/query",
-            params={"query": invoice_query},
+            params={"query": f"SELECT * FROM Invoice WHERE TxnDate >= '{since_date}'"},
             headers=headers,
         )
         resp.raise_for_status()
@@ -117,17 +132,12 @@ def sync_transactions(db: Session, days_back: int = 1) -> dict:
     for inv in invoices:
         external_id = f"qb_invoice_{inv['Id']}"
         exists = db.query(Transaction).filter(
-            and_(
-                Transaction.external_id == external_id,
-                Transaction.source == "quickbooks",
-            )
+            and_(Transaction.external_id == external_id, Transaction.source == "quickbooks")
         ).first()
-
         if exists:
             skipped += 1
             continue
-
-        txn = Transaction(
+        db.add(Transaction(
             external_id=external_id,
             source="quickbooks",
             type="revenue",
@@ -137,16 +147,13 @@ def sync_transactions(db: Session, days_back: int = 1) -> dict:
             status="settled" if inv.get("Balance", 1) == 0 else "pending",
             transaction_date=datetime.strptime(inv["TxnDate"], "%Y-%m-%d"),
             raw_data=inv,
-        )
-        db.add(txn)
+        ))
         created += 1
 
-    # Fetch payments
-    payment_query = f"SELECT * FROM Payment WHERE TxnDate >= '{since_date}'"
     with httpx.Client() as client:
         resp = client.get(
             f"{base_url}/v3/company/{token.realm_id}/query",
-            params={"query": payment_query},
+            params={"query": f"SELECT * FROM Payment WHERE TxnDate >= '{since_date}'"},
             headers=headers,
         )
         resp.raise_for_status()
@@ -155,17 +162,12 @@ def sync_transactions(db: Session, days_back: int = 1) -> dict:
     for pmt in payments:
         external_id = f"qb_payment_{pmt['Id']}"
         exists = db.query(Transaction).filter(
-            and_(
-                Transaction.external_id == external_id,
-                Transaction.source == "quickbooks",
-            )
+            and_(Transaction.external_id == external_id, Transaction.source == "quickbooks")
         ).first()
-
         if exists:
             skipped += 1
             continue
-
-        txn = Transaction(
+        db.add(Transaction(
             external_id=external_id,
             source="quickbooks",
             type="revenue",
@@ -174,8 +176,7 @@ def sync_transactions(db: Session, days_back: int = 1) -> dict:
             status="settled",
             transaction_date=datetime.strptime(pmt["TxnDate"], "%Y-%m-%d"),
             raw_data=pmt,
-        )
-        db.add(txn)
+        ))
         created += 1
 
     db.commit()
@@ -183,9 +184,7 @@ def sync_transactions(db: Session, days_back: int = 1) -> dict:
 
 
 def _extract_category(invoice: dict) -> str:
-    """Pull the first line item's description as the service category."""
-    lines = invoice.get("Line", [])
-    for line in lines:
+    for line in invoice.get("Line", []):
         desc = line.get("Description", "")
         if desc:
             return desc[:100]
