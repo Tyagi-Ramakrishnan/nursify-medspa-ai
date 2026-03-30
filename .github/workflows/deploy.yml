@@ -1,0 +1,96 @@
+name: Deploy to Railway
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: Run tests
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: nursify_test
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install backend deps
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: Run backend tests
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://user:password@localhost:5432/nursify_test
+          REDIS_URL: redis://localhost:6379
+          APP_SECRET_KEY: test-secret-key
+          QB_CLIENT_ID: test
+          QB_CLIENT_SECRET: test
+          QB_REDIRECT_URI: http://localhost:8000/api/v1/quickbooks/callback
+          QB_ENVIRONMENT: sandbox
+          SMTP_HOST: localhost
+          SMTP_PORT: "587"
+          SMTP_USER: test
+          SMTP_PASSWORD: test
+          REPORT_FROM_EMAIL: test@test.com
+          REPORT_TO_EMAIL: test@test.com
+          ADMIN_EMAIL: admin@test.com
+          ADMIN_PASSWORD: testpassword
+        run: python -m pytest tests/ -v
+
+  deploy-backend:
+    needs: test
+    runs-on: ubuntu-latest
+    name: Deploy backend
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy backend to Railway
+        working-directory: backend
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: railway up --service nursify-backend
+
+  deploy-frontend:
+    needs: test
+    runs-on: ubuntu-latest
+    name: Deploy frontend
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Vercel CLI
+        run: npm install -g vercel
+
+      - name: Deploy frontend to Vercel
+        working-directory: frontend
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: vercel --prod --token=$VERCEL_TOKEN
