@@ -145,6 +145,7 @@ export default function Dashboard() {
             className="text-sm text-gray-600 border border-gray-200 rounded-lg px-3 py-1.5 hover:bg-gray-50 disabled:opacity-40">
             {syncing ? "Syncing…" : "Sync now"}
           </button>
+          <a href="/categorize" className="text-sm text-teal-700 border border-teal-200 rounded-lg px-3 py-1.5 hover:bg-teal-50">AI Categorize</a>
           <button onClick={logout} className="text-sm text-gray-400 hover:text-gray-600">Sign out</button>
         </div>
       </header>

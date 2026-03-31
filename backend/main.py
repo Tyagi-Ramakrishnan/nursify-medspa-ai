@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
-from app.api.routes import auth, quickbooks, transactions, reports
+from app.api.routes import auth, quickbooks, transactions, reports, categorize
 
 app = FastAPI(
     title="Nursify MedSpa AI",
@@ -29,6 +29,7 @@ if settings.DATABASE_URL:
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
 app.include_router(quickbooks.router, prefix="/api/v1/quickbooks", tags=["quickbooks"])
 app.include_router(transactions.router, prefix="/api/v1/transactions", tags=["transactions"])
+app.include_router(categorize.router, prefix="/api/v1/categorize", tags=["categorize"])
 app.include_router(reports.router, prefix="/api/v1/reports", tags=["reports"])
 
 
