@@ -10,8 +10,8 @@ router = APIRouter()
 
 
 @router.get("/connect")
-def connect_quickbooks(user: dict = Depends(get_current_user)):
-    """Step 1: Redirect the user to QuickBooks to authorize the connection."""
+def connect_quickbooks():
+    """Redirect to QuickBooks — no auth required, it's just a redirect."""
     url = get_authorization_url()
     return RedirectResponse(url)
 
@@ -23,9 +23,9 @@ def quickbooks_callback(
     realmId: str,
     db: Session = Depends(get_db),
 ):
-    """Step 2: QuickBooks redirects here with the auth code. Exchange it for tokens."""
+    """QuickBooks redirects here with the auth code."""
     handle_callback(auth_code=code, realm_id=realmId, db=db)
-    return {"status": "connected", "realm_id": realmId}
+    return RedirectResponse("/?connected=true")
 
 
 @router.get("/status")
@@ -33,7 +33,6 @@ def connection_status(
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
-    """Check whether a QuickBooks connection is active."""
     token = db.query(QuickBooksToken).filter_by(is_active=True).first()
     if not token:
         return {"connected": False}
@@ -49,6 +48,5 @@ def manual_sync(
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
-    """Manually trigger a QuickBooks sync — useful for testing."""
     result = sync_transactions(db, days_back=7)
     return result
