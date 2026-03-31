@@ -50,3 +50,29 @@ def manual_sync(
 ):
     result = sync_transactions(db, days_back=7)
     return result
+
+
+@router.get("/debug")
+def debug_sync(db: Session = Depends(get_db)):
+    """Temporary debug endpoint — shows raw QB query results."""
+    from app.services.quickbooks_service import get_active_token, _qb_query
+    token = get_active_token(db)
+    if not token:
+        return {"error": "No active token", "realm_id": None}
+    
+    try:
+        invoices = _qb_query(token, "SELECT * FROM Invoice MAXRESULTS 5")
+        purchases = _qb_query(token, "SELECT * FROM Purchase MAXRESULTS 5")
+        bills = _qb_query(token, "SELECT * FROM Bill MAXRESULTS 5")
+        receipts = _qb_query(token, "SELECT * FROM SalesReceipt MAXRESULTS 5")
+        return {
+            "realm_id": token.realm_id,
+            "token_expires": token.access_token_expires_at.isoformat(),
+            "invoices_found": len(invoices),
+            "purchases_found": len(purchases),
+            "bills_found": len(bills),
+            "receipts_found": len(receipts),
+            "sample_purchase": purchases[0] if purchases else None,
+        }
+    except Exception as e:
+        return {"error": str(e), "realm_id": token.realm_id}
