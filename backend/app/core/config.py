@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     ADMIN_EMAIL: str = "admin@nursify.com"
     ADMIN_PASSWORD: str = "changeme"
 
+    ANTHROPIC_API_KEY: str = ""
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 8
 
     class Config:
