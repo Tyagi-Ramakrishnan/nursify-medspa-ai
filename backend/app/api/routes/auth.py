@@ -6,16 +6,22 @@ from app.core.security import verify_password, hash_password, create_access_toke
 
 router = APIRouter()
 
-# MVP: single hardcoded admin user
-# Replace with a users table when you add multi-tenant support
-ADMIN_HASH = hash_password(settings.ADMIN_PASSWORD)
+# Hash is computed lazily on first login — not at import time
+# This avoids bcrypt crashing before the server starts
+_admin_hash: str | None = None
+
+def get_admin_hash() -> str:
+    global _admin_hash
+    if _admin_hash is None:
+        _admin_hash = hash_password(settings.ADMIN_PASSWORD)
+    return _admin_hash
 
 
 @router.post("/login")
 def login(form: OAuth2PasswordRequestForm = Depends()):
     if form.username != settings.ADMIN_EMAIL:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-    if not verify_password(form.password, ADMIN_HASH):
+    if not verify_password(form.password, get_admin_hash()):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
     token = create_access_token({"sub": form.username, "role": "admin"})
@@ -23,6 +29,5 @@ def login(form: OAuth2PasswordRequestForm = Depends()):
 
 
 @router.get("/me")
-def me(user: dict = Depends(lambda: None)):
-    # Protected by get_current_user in real routes — placeholder
+def me():
     return {"email": settings.ADMIN_EMAIL, "role": "admin"}
