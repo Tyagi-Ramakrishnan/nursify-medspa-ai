@@ -126,7 +126,7 @@ def _insert_txn(db: Session, external_id: str, source: str, **kwargs) -> bool:
         created_at=datetime.utcnow(),
         currency="USD",
         **kwargs,
-    ).on_conflict_do_nothing(constraint="ix_transactions_external_source")
+    ).on_conflict_do_nothing(index_elements=["external_id", "source"])
     result = db.execute(stmt)
     db.commit()
     return result.rowcount > 0
@@ -142,11 +142,11 @@ def sync_transactions(db: Session, days_back: int = 90) -> dict:
     skipped = 0
 
     queries = [
-        ("Invoice", f"SELECT * FROM Invoice WHERE TxnDate >= '{since_date}'"),
-        ("Payment", f"SELECT * FROM Payment WHERE TxnDate >= '{since_date}'"),
-        ("SalesReceipt", f"SELECT * FROM SalesReceipt WHERE TxnDate >= '{since_date}'"),
-        ("Purchase", f"SELECT * FROM Purchase WHERE TxnDate >= '{since_date}'"),
-        ("Bill", f"SELECT * FROM Bill WHERE TxnDate >= '{since_date}'"),
+        ("Invoice", f"SELECT * FROM Invoice MAXRESULTS 100"),
+        ("Payment", f"SELECT * FROM Payment MAXRESULTS 100"),
+        ("SalesReceipt", f"SELECT * FROM SalesReceipt MAXRESULTS 100"),
+        ("Purchase", f"SELECT * FROM Purchase MAXRESULTS 100"),
+        ("Bill", f"SELECT * FROM Bill MAXRESULTS 100"),
     ]
 
     for obj_type, query in queries:
