@@ -140,6 +140,7 @@ Respond with ONLY a JSON array, no other text:
             },
             timeout=30,
         )
+        print(f"[claude] status={response.status_code} body={response.text[:500]}")
         response.raise_for_status()
         content = response.json()["content"][0]["text"]
 
