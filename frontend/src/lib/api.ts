@@ -57,8 +57,8 @@ export function isLoggedIn(): boolean {
 export const getTodayReport = () =>
   request<Record<string, any>>("/api/v1/reports/today");
 
-export const getLast7Days = () =>
-  request<Array<Record<string, any>>>("/api/v1/reports/last-7-days");
+export const getLast30Days = () =>
+  request<Array<Record<string, any>>>("/api/v1/reports/last-30-days");
 
 export const triggerReport = (sendEmail = false) =>
   request("/api/v1/reports/generate", {
