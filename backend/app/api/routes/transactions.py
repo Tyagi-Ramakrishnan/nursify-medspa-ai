@@ -16,7 +16,7 @@ def list_transactions(
     end_date: Optional[date] = Query(default=None),
     source: Optional[str] = Query(default=None),
     type: Optional[str] = Query(default=None),
-    limit: int = Query(default=100, le=500),
+    limit: int = Query(default=500, le=5000),
     offset: int = Query(default=0),
     db: Session = Depends(get_db),
     user: dict = Depends(get_current_user),
