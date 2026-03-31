@@ -1,6 +1,5 @@
 """
 QuickBooks service — OAuth 2.0 and transaction sync using direct HTTP calls.
-No third-party QB libraries needed — just httpx.
 """
 
 import base64
@@ -105,87 +104,173 @@ def get_active_token(db: Session) -> Optional[QuickBooksToken]:
     return token
 
 
-def sync_transactions(db: Session, days_back: int = 1) -> dict:
-    token = get_active_token(db)
-    if not token:
-        return {"status": "error", "message": "No active QuickBooks connection"}
-
-    since_date = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+def _qb_query(token: QuickBooksToken, query: str) -> list:
+    """Run a QuickBooks query and return the results."""
     base_url = QB_BASE.get(settings.QB_ENVIRONMENT, QB_BASE["sandbox"])
     headers = {
         "Authorization": f"Bearer {token.access_token}",
         "Accept": "application/json",
     }
+    with httpx.Client(timeout=30) as client:
+        resp = client.get(
+            f"{base_url}/v3/company/{token.realm_id}/query",
+            params={"query": query},
+            headers=headers,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("QueryResponse", {})
+        # Return first non-empty list found
+        for v in data.values():
+            if isinstance(v, list):
+                return v
+        return []
 
+
+def _upsert_transaction(db: Session, external_id: str, **kwargs) -> bool:
+    """Insert transaction if it doesn't exist. Returns True if created."""
+    exists = db.query(Transaction).filter(
+        and_(
+            Transaction.external_id == external_id,
+            Transaction.source == "quickbooks",
+        )
+    ).first()
+    if exists:
+        return False
+    db.add(Transaction(external_id=external_id, source="quickbooks", **kwargs))
+    return True
+
+
+def sync_transactions(db: Session, days_back: int = 90) -> dict:
+    """
+    Pull all transaction types from QuickBooks.
+    Covers: Invoice, Payment, Purchase, Bill, SalesReceipt
+    """
+    token = get_active_token(db)
+    if not token:
+        return {"status": "error", "message": "No active QuickBooks connection"}
+
+    since_date = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     created = 0
     skipped = 0
 
-    with httpx.Client() as client:
-        resp = client.get(
-            f"{base_url}/v3/company/{token.realm_id}/query",
-            params={"query": f"SELECT * FROM Invoice WHERE TxnDate >= '{since_date}'"},
-            headers=headers,
-        )
-        resp.raise_for_status()
-        invoices = resp.json().get("QueryResponse", {}).get("Invoice", [])
-
-    for inv in invoices:
-        external_id = f"qb_invoice_{inv['Id']}"
-        exists = db.query(Transaction).filter(
-            and_(Transaction.external_id == external_id, Transaction.source == "quickbooks")
-        ).first()
-        if exists:
-            skipped += 1
-            continue
-        db.add(Transaction(
-            external_id=external_id,
-            source="quickbooks",
+    # --- Invoices (revenue) ---
+    for inv in _qb_query(token, f"SELECT * FROM Invoice WHERE TxnDate >= '{since_date}'"):
+        txn_date = _parse_date(inv.get("TxnDate"))
+        if _upsert_transaction(
+            db,
+            external_id=f"qb_invoice_{inv['Id']}",
             type="revenue",
             amount=inv.get("TotalAmt", 0),
-            description=inv.get("CustomerRef", {}).get("name", ""),
-            category=_extract_category(inv),
+            description=inv.get("CustomerRef", {}).get("name", "Invoice"),
+            category=_extract_invoice_category(inv),
             status="settled" if inv.get("Balance", 1) == 0 else "pending",
-            transaction_date=datetime.strptime(inv["TxnDate"], "%Y-%m-%d"),
+            transaction_date=txn_date,
             raw_data=inv,
-        ))
-        created += 1
-
-    with httpx.Client() as client:
-        resp = client.get(
-            f"{base_url}/v3/company/{token.realm_id}/query",
-            params={"query": f"SELECT * FROM Payment WHERE TxnDate >= '{since_date}'"},
-            headers=headers,
-        )
-        resp.raise_for_status()
-        payments = resp.json().get("QueryResponse", {}).get("Payment", [])
-
-    for pmt in payments:
-        external_id = f"qb_payment_{pmt['Id']}"
-        exists = db.query(Transaction).filter(
-            and_(Transaction.external_id == external_id, Transaction.source == "quickbooks")
-        ).first()
-        if exists:
+        ):
+            created += 1
+        else:
             skipped += 1
-            continue
-        db.add(Transaction(
-            external_id=external_id,
-            source="quickbooks",
+
+    # --- Payments (revenue) ---
+    for pmt in _qb_query(token, f"SELECT * FROM Payment WHERE TxnDate >= '{since_date}'"):
+        txn_date = _parse_date(pmt.get("TxnDate"))
+        if _upsert_transaction(
+            db,
+            external_id=f"qb_payment_{pmt['Id']}",
             type="revenue",
             amount=pmt.get("TotalAmt", 0),
-            description=pmt.get("CustomerRef", {}).get("name", ""),
+            description=pmt.get("CustomerRef", {}).get("name", "Payment"),
             status="settled",
-            transaction_date=datetime.strptime(pmt["TxnDate"], "%Y-%m-%d"),
+            transaction_date=txn_date,
             raw_data=pmt,
-        ))
-        created += 1
+        ):
+            created += 1
+        else:
+            skipped += 1
+
+    # --- Sales Receipts (revenue) ---
+    for sr in _qb_query(token, f"SELECT * FROM SalesReceipt WHERE TxnDate >= '{since_date}'"):
+        txn_date = _parse_date(sr.get("TxnDate"))
+        if _upsert_transaction(
+            db,
+            external_id=f"qb_salesreceipt_{sr['Id']}",
+            type="revenue",
+            amount=sr.get("TotalAmt", 0),
+            description=sr.get("CustomerRef", {}).get("name", "Sales Receipt"),
+            category=_extract_invoice_category(sr),
+            status="settled",
+            transaction_date=txn_date,
+            raw_data=sr,
+        ):
+            created += 1
+        else:
+            skipped += 1
+
+    # --- Purchases / Expenses ---
+    for pur in _qb_query(token, f"SELECT * FROM Purchase WHERE TxnDate >= '{since_date}'"):
+        txn_date = _parse_date(pur.get("TxnDate"))
+        account_ref = pur.get("AccountRef", {}).get("name", "")
+        category = account_ref if account_ref and "uncategorized" not in account_ref.lower() else None
+        if _upsert_transaction(
+            db,
+            external_id=f"qb_purchase_{pur['Id']}",
+            type="expense",
+            amount=pur.get("TotalAmt", 0),
+            description=pur.get("EntityRef", {}).get("name") or pur.get("PrivateNote", "Expense"),
+            category=category,
+            status="settled",
+            transaction_date=txn_date,
+            raw_data=pur,
+        ):
+            created += 1
+        else:
+            skipped += 1
+
+    # --- Bills (expenses) ---
+    for bill in _qb_query(token, f"SELECT * FROM Bill WHERE TxnDate >= '{since_date}'"):
+        txn_date = _parse_date(bill.get("TxnDate"))
+        if _upsert_transaction(
+            db,
+            external_id=f"qb_bill_{bill['Id']}",
+            type="expense",
+            amount=bill.get("TotalAmt", 0),
+            description=bill.get("VendorRef", {}).get("name", "Bill"),
+            category=_extract_bill_category(bill),
+            status="pending" if float(bill.get("Balance", 0)) > 0 else "settled",
+            transaction_date=txn_date,
+            raw_data=bill,
+        ):
+            created += 1
+        else:
+            skipped += 1
 
     db.commit()
     return {"status": "ok", "created": created, "skipped": skipped}
 
 
-def _extract_category(invoice: dict) -> str:
-    for line in invoice.get("Line", []):
+def _parse_date(date_str: str) -> datetime:
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d")
+    except Exception:
+        return datetime.utcnow()
+
+
+def _extract_invoice_category(obj: dict) -> Optional[str]:
+    for line in obj.get("Line", []):
+        detail = line.get("SalesItemLineDetail", {})
+        item = detail.get("ItemRef", {}).get("name", "")
+        if item:
+            return item[:100]
         desc = line.get("Description", "")
         if desc:
             return desc[:100]
-    return "uncategorized"
+    return None
+
+
+def _extract_bill_category(bill: dict) -> Optional[str]:
+    for line in bill.get("Line", []):
+        detail = line.get("AccountBasedExpenseLineDetail", {})
+        account = detail.get("AccountRef", {}).get("name", "")
+        if account and "uncategorized" not in account.lower():
+            return account[:100]
+    return None
